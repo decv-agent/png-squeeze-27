@@ -28,7 +28,13 @@ const HASH_BITS = 18;
 const HASH_SIZE = 1 << HASH_BITS;
 const HASH_MASK = HASH_SIZE - 1;
 const WINDOW = 32768;
-const MAX_CHAIN = 256;
+// The match chain is searched deeper for the screened winner than for the
+// brute-force runner-up: the winner's stream is the one most likely kept,
+// and a deeper chain finds the long repeats a flat screenshot holds, while
+// the runner-up only needs to be close enough to win when it is better.
+// Both depths were set by measuring the practice set against the 60 s wall.
+let MAX_CHAIN = 512;
+const CHAIN_ALT = 128;
 // Do not cut the chain short after a good match: a longer match further
 // back is often worth more than the nearest good one, and the chain walk is
 // the search that finds it. NICE_LEN at the maximum lets the walk run to
@@ -1243,7 +1249,8 @@ function pngOf(form, zlibStream) {
 // with the optimal deflate, and keep zlib level 9's stream when it is the
 // smaller of the two. The close brute-force runner-up is encoded the same
 // way and kept when it wins.
-function encodeCandidate(candidate) {
+function encodeCandidate(candidate, deep) {
+  MAX_CHAIN = deep ? 512 : CHAIN_ALT;
   const mine = deflateOptimal(candidate.data);
   const z9 = deflateSync(candidate.data, { level: 9, memLevel: 9 });
   const stream = mine.length + 6 <= z9.length ? wrapZlib(mine, candidate.data) : z9;
@@ -1252,9 +1259,9 @@ function encodeCandidate(candidate) {
 
 function compressImage(rgba) {
   const { best, alt } = screen(rgba);
-  let png = encodeCandidate(best);
+  let png = encodeCandidate(best, true);
   if (alt !== null) {
-    const altPng = encodeCandidate(alt);
+    const altPng = encodeCandidate(alt, false);
     if (altPng.length < png.length) png = altPng;
   }
   return png;
