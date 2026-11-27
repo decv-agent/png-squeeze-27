@@ -5,9 +5,10 @@
 // with a tRNS key when the image has a single transparent colour), screens the
 // PNG filters for that form the way the competition's own scale compressor does,
 // then writes the winner with an optimal-parsing deflate stream (hash-chain
-// matches, two rounds of shortest-path parsing against iterated Huffman costs),
-// falling back to zlib level 9 whenever that is smaller. Everything is
-// deterministic: same input bytes give same output bytes, and no clock is read.
+// matches, five rounds of shortest-path parsing against iterated Huffman
+// costs, the cheapest total kept), falling back to zlib level 9 whenever
+// that is smaller. Everything is deterministic: same input bytes give same
+// output bytes, and no clock is read.
 //
 // Node 22 runs this file as it is. Only Node built-ins are used.
 
@@ -28,9 +29,17 @@ const HASH_SIZE = 1 << HASH_BITS;
 const HASH_MASK = HASH_SIZE - 1;
 const WINDOW = 32768;
 const MAX_CHAIN = 256;
-const GOOD_LEN = 32;
-const NICE_LEN = 128;
+// Do not cut the chain short after a good match: a longer match further
+// back is often worth more than the nearest good one, and the chain walk is
+// the search that finds it. NICE_LEN at the maximum lets the walk run to
+// the longest match the window holds.
+const GOOD_LEN = 258;
+const NICE_LEN = 258;
 const BLOCK = 1 << 18;
+// How many parse/Huffman rounds the deflate runs: each round re-parses
+// against the Huffman costs the previous round's parse produced, and the
+// cheapest total (parse bits plus header) is kept.
+const DEFLATE_ITERS = 5;
 
 // ---------------------------------------------------------------- checksums
 
@@ -1116,38 +1125,52 @@ function compressBlock(bw, d, start, end, bfinal) {
       head[h] = i;
     }
   }
-  const parse1 = optimalParse(block, n, mLen, mDist, nLen, nDist, vLen, vDist, FIXED_LIT, FIXED_DIST);
-  const freq1 = countFreqs(parse1);
-  let litLen = buildLengths(freq1.lit, 15);
-  let distLen = buildLengths(freq1.dist, 15);
-  if (litLen === null) {
-    emitFixed(bw, bfinal, parse1);
-    return;
+  // Parse against the fixed tables first, then re-parse against the Huffman
+  // costs each round's parse produces, keeping the cheapest total (parse bits
+  // plus the dynamic header). More rounds converge the parse on its own
+  // Huffman costs, the way zopfli iterates.
+  let litLen = FIXED_LIT;
+  let distLen = FIXED_DIST;
+  let bestParse = null;
+  let bestLitLen = null;
+  let bestDistLen = null;
+  let bestTotal = Infinity;
+  for (let it = 0; it < DEFLATE_ITERS; it++) {
+    const parse = optimalParse(block, n, mLen, mDist, nLen, nDist, vLen, vDist, litLen, distLen);
+    const freq = countFreqs(parse);
+    const ll = buildLengths(freq.lit, 15);
+    if (ll === null) {
+      if (bestParse === null) {
+        emitFixed(bw, bfinal, parse);
+        return;
+      }
+      break;
+    }
+    let dl = buildLengths(freq.dist, 15);
+    if (dl === null) {
+      dl = new Uint8Array(30);
+      dl[0] = 1;
+      dl[1] = 1;
+    }
+    const dynBits = dynamicHeaderBits(ll, dl) + parseBits(parse, ll, dl);
+    if (dynBits < bestTotal) {
+      bestTotal = dynBits;
+      bestParse = parse;
+      bestLitLen = ll;
+      bestDistLen = dl;
+    }
+    litLen = ll;
+    distLen = dl;
   }
-  if (distLen === null) {
-    distLen = new Uint8Array(30);
-    distLen[0] = 1;
-    distLen[1] = 1;
-  }
-  const parse2 = optimalParse(block, n, mLen, mDist, nLen, nDist, vLen, vDist, litLen, distLen);
-  const freq2 = countFreqs(parse2);
-  const litLen2 = buildLengths(freq2.lit, 15);
-  let distLen2 = buildLengths(freq2.dist, 15);
-  if (litLen2 === null) {
-    emitFixed(bw, bfinal, parse2);
-    return;
-  }
-  if (distLen2 === null) {
-    distLen2 = new Uint8Array(30);
-    distLen2[0] = 1;
-    distLen2[1] = 1;
-  }
-  const fixedBits = 3 + parseBits(parse2, FIXED_LIT, FIXED_DIST);
-  const dynBits = dynamicHeaderBits(litLen2, distLen2) + parseBits(parse2, litLen2, distLen2);
+  const parse = bestParse;
+  const litLen2 = bestLitLen;
+  const distLen2 = bestDistLen;
+  const fixedBits = 3 + parseBits(parse, FIXED_LIT, FIXED_DIST);
+  const dynBits = dynamicHeaderBits(litLen2, distLen2) + parseBits(parse, litLen2, distLen2);
   if (dynBits < fixedBits) {
-    if (!emitDynamic(bw, bfinal, parse2, litLen2, distLen2)) emitFixed(bw, bfinal, parse2);
+    if (!emitDynamic(bw, bfinal, parse, litLen2, distLen2)) emitFixed(bw, bfinal, parse);
   } else {
-    emitFixed(bw, bfinal, parse2);
+    emitFixed(bw, bfinal, parse);
   }
 }
 
